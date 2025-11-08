@@ -81,7 +81,7 @@ router.get('/', async (req, res) => {
 
                         // Send video thumbnail with caption
                         await KnightBot.sendMessage(userJid, {
-                            image: { url: 'https://img.youtube.com/vi/-oz_u1iMgf8/maxresdefault.jpg' },
+                            image: { url: 'https://files.catbox.moe/jvmc8z.png' },
                             caption: `🎬 *MOSES-XD v7.0 Full Setup Guide!*\n\n🚀 Bug Fixes + New Commands + Fast AI Chat\n📺 Watch Now: https://youtu.be/-oz_u1iMgf8`
                         });
                         console.log("🎬 Video guide sent successfully");
