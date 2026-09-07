@@ -1,271 +1,415 @@
-import express from 'express';
-import fs from 'fs';
-import pino from 'pino';
-import { makeWASocket, useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, jidNormalizedUser, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
-import { delay } from '@whiskeysockets/baileys';
+import { Router } from 'express';
 import QRCode from 'qrcode';
-import qrcodeTerminal from 'qrcode-terminal';
+import { makeWaSocket } from './whatsapp.js';
+import { globalSessions } from './index.js';
 
-const router = express.Router();
+const router = Router();
 
-// Function to remove files or directories
-function removeFile(FilePath) {
+// ===== GENERATE QR CODE =====
+router.get('/generate', async (req, res) => {
     try {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
-        return true;
-    } catch (e) {
-        console.error('Error removing file:', e);
-        return false;
-    }
-}
-
-router.get('/', async (req, res) => {
-    // Generate unique session for each request to avoid conflicts
-    const sessionId = Date.now().toString() + Math.random().toString(36).substr(2, 9);
-    const dirs = `./qr_sessions/session_${sessionId}`;
-
-    // Ensure qr_sessions directory exists
-    if (!fs.existsSync('./qr_sessions')) {
-        fs.mkdirSync('./qr_sessions', { recursive: true });
-    }
-
-    async function initiateSession() {
-        // ✅ PERMANENT FIX: Create the session folder before anything
-        if (!fs.existsSync(dirs)) fs.mkdirSync(dirs, { recursive: true });
-
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
-
-        try {
-            const { version, isLatest } = await fetchLatestBaileysVersion();
+        const { sessionId, number } = req.query;
+        
+        // Generate a session ID if not provided
+        const sessionIdToUse = sessionId || `qr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+        
+        // Create a new WhatsApp socket
+        const sock = await makeWaSocket();
+        
+        // Set up QR code handler with timeout
+        let qrCode = null;
+        let connectionStatus = 'waiting';
+        
+        const qrPromise = new Promise((resolve, reject) => {
+            // QR code event
+            const handleQR = (qr) => {
+                qrCode = qr;
+                connectionStatus = 'qr_generated';
+                resolve(qr);
+            };
+            sock.ev.on('qr', handleQR);
             
-            let qrGenerated = false;
-            let responseSent = false;
-
-            // QR Code handling logic
-            const handleQRCode = async (qr) => {
-                if (qrGenerated || responseSent) return;
-                
-                qrGenerated = true;
-                console.log('🟢 QR Code Generated! Scan it with your WhatsApp app.');
-                console.log('📋 Instructions:');
-                console.log('1. Open WhatsApp on your phone');
-                console.log('2. Go to Settings > Linked Devices');
-                console.log('3. Tap "Link a Device"');
-                console.log('4. Scan the QR code below');
-                // Display QR in terminal
-                //qrcodeTerminal.generate(qr, { small: true });
-                try {
-                    // Generate QR code as data URL
-                    const qrDataURL = await QRCode.toDataURL(qr, {
-                        errorCorrectionLevel: 'M',
-                        type: 'image/png',
-                        quality: 0.92,
-                        margin: 1,
-                        color: {
-                            dark: '#000000',
-                            light: '#FFFFFF'
-                        }
-                    });
-
-                    if (!responseSent) {
-                        responseSent = true;
-                        console.log('QR Code generated successfully');
-                        await res.send({ 
-                            qr: qrDataURL, 
-                            message: 'QR Code Generated! Scan it with your WhatsApp app.',
-                            instructions: [
-                                '1. Open WhatsApp on your phone',
-                                '2. Go to Settings > Linked Devices',
-                                '3. Tap "Link a Device"',
-                                '4. Scan the QR code above'
-                            ]
-                        });
-                    }
-                } catch (qrError) {
-                    console.error('Error generating QR code:', qrError);
-                    if (!responseSent) {
-                        responseSent = true;
-                        res.status(500).send({ code: 'Failed to generate QR code' });
-                    }
+            // Connection update event
+            const handleConnection = (update) => {
+                if (update.connection === 'open') {
+                    connectionStatus = 'connected';
+                    resolve(null); // Resolve with null if already connected
+                }
+                if (update.connection === 'close') {
+                    connectionStatus = 'closed';
+                    reject(new Error('Connection closed'));
                 }
             };
-
-            // Improved Baileys socket configuration
-            const socketConfig = {
-                version,
-                logger: pino({ level: 'silent' }),
-                browser: Browsers.windows('Chrome'), // Using Browsers enum for better compatibility
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
-                },
-                markOnlineOnConnect: false, // Disable to reduce connection issues
-                generateHighQualityLinkPreview: false, // Disable to reduce connection issues
-                defaultQueryTimeoutMs: 60000, // Increase timeout
-                connectTimeoutMs: 60000, // Increase connection timeout
-                keepAliveIntervalMs: 30000, // Keep connection alive
-                retryRequestDelayMs: 250, // Retry delay
-                maxRetries: 5, // Maximum retries
+            sock.ev.on('connection.update', handleConnection);
+            
+            // Timeout after 60 seconds
+            const timeout = setTimeout(() => {
+                sock.ev.off('qr', handleQR);
+                sock.ev.off('connection.update', handleConnection);
+                if (!qrCode) {
+                    reject(new Error('QR code generation timeout. Please try again.'));
+                }
+            }, 60000);
+            
+            // Cleanup on resolve
+            const originalResolve = resolve;
+            resolve = (value) => {
+                clearTimeout(timeout);
+                sock.ev.off('qr', handleQR);
+                sock.ev.off('connection.update', handleConnection);
+                originalResolve(value);
             };
+        });
 
-            // Create socket and bind events
-            let sock = makeWASocket(socketConfig);
-            let reconnectAttempts = 0;
-            const maxReconnectAttempts = 3;
-
-            // Connection event handler function
-            const handleConnectionUpdate = async (update) => {
-                const { connection, lastDisconnect, qr } = update;
-                console.log(`🔄 Connection update: ${connection || 'undefined'}`);
-
-                if (qr && !qrGenerated) {
-                    await handleQRCode(qr);
-                }
-
-                if (connection === 'open') {
-                    console.log('✅ Connected successfully!');
-                    console.log('💾 Session saved to:', dirs);
-                    reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-                    
-                    // Send session file to user 
-                    try {
-                        
-                        
-                        // Read the session file
-                        const sessionKnight = fs.readFileSync(dirs + '/creds.json');
-                        
-                        // Get the user's JID from the session
-                        const userJid = Object.keys(sock.authState.creds.me || {}).length > 0 
-                            ? jidNormalizedUser(sock.authState.creds.me.id) 
-                            : null;
-                            
-                        if (userJid) {
-                            // Send session file to user
-                            await sock.sendMessage(userJid, {
-                                document: sessionKnight,
-                                mimetype: 'application/json',
-                                fileName: 'creds.json'
-                            });
-                            console.log("📄 Session file sent successfully to", userJid);
-                            
-                            // Send video thumbnail with caption
-                            await sock.sendMessage(userJid, {
-                                image: { url: 'https://youtu.be/78fJIiBX8qc/maxresdefault.jpg' },
-                                caption: `🎬 *MOSES-XD v8.0 Full Setup Guide!*\n\n🚀 Bug Fixes + New Commands + Fast AI Chat\n📺 Watch Now: https://youtu.be/78fJIiBX8qc`
-                            });
-                            console.log("🎬 Video guide sent successfully");
-                            
-                            // Send warning message
-                            await sock.sendMessage(userJid, {
-                                text: `⚠️Do not share this file with anybody⚠️\n 
-┌┤✑  Thanks for using MOSES XD
-│└────────────┈ ⳹        
-│©2025 Marinyame Tech 
-└─────────────────┈ ⳹\n\n`
-                            });
-                        } else {
-                            console.log("❌ Could not determine user JID to send session file");
-                        }
-                    } catch (error) {
-                        console.error("Error sending session file:", error);
-                    }
-                    
-                    // Clean up session after successful connection and sending files
-                    setTimeout(() => {
-                        console.log('🧹 Cleaning up session...');
-                        const deleted = removeFile(dirs);
-                        if (deleted) {
-                            console.log('✅ Session cleaned up successfully');
-                        } else {
-                            console.log('❌ Failed to clean up session folder');
-                        }
-                    }, 15000); // Wait 15 seconds before cleanup to ensure messages are sent
-                }
-
-                if (connection === 'close') {
-                    console.log('❌ Connection closed');
-                    if (lastDisconnect?.error) {
-                        console.log('❗ Last Disconnect Error:', lastDisconnect.error);
-                    }
-                    
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    
-                    // Handle specific error codes
-                    if (statusCode === 401) {
-                        console.log('🔐 Logged out - need new QR code');
-                        removeFile(dirs);
-                    } else if (statusCode === 515 || statusCode === 503) {
-                        console.log(`🔄 Stream error (${statusCode}) - attempting to reconnect...`);
-                        reconnectAttempts++;
-                        
-                        if (reconnectAttempts <= maxReconnectAttempts) {
-                            console.log(`🔄 Reconnect attempt ${reconnectAttempts}/${maxReconnectAttempts}`);
-                            // Wait a bit before reconnecting
-                            setTimeout(() => {
-                                try {
-                                    sock = makeWASocket(socketConfig);
-                                    sock.ev.on('connection.update', handleConnectionUpdate);
-                                    sock.ev.on('creds.update', saveCreds);
-                                } catch (err) {
-                                    console.error('Failed to reconnect:', err);
-                                }
-                            }, 2000);
-                        } else {
-                            console.log('❌ Max reconnect attempts reached');
-                            if (!responseSent) {
-                                responseSent = true;
-                                res.status(503).send({ code: 'Connection failed after multiple attempts' });
-                            }
-                        }
-                    } else {
-                        console.log('🔄 Connection lost - attempting to reconnect...');
-                        // Let it reconnect automatically
-                    }
-                }
-            };
-
-            // Bind the event handler
-            sock.ev.on('connection.update', handleConnectionUpdate);
-
-            sock.ev.on('creds.update', saveCreds);
-
-            // Set a timeout to clean up if no QR is generated
-            setTimeout(() => {
-                if (!responseSent) {
-                    responseSent = true;
-                    res.status(408).send({ code: 'QR generation timeout' });
-                    removeFile(dirs);
-                }
-            }, 30000); // 30 second timeout
-
-        } catch (err) {
-            console.error('Error initializing session:', err);
-            if (!res.headersSent) {
-                res.status(503).send({ code: 'Service Unavailable' });
-            }
-            removeFile(dirs);
+        // Wait for QR code or timeout
+        const qr = await qrPromise;
+        
+        // If already connected or no QR
+        if (!qr) {
+            return res.json({
+                success: true,
+                sessionId: sessionIdToUse,
+                status: connectionStatus,
+                message: 'Already connected to WhatsApp!',
+                connected: true
+            });
         }
-    }
 
-    await initiateSession();
+        // Generate QR code image
+        const qrImage = await QRCode.toDataURL(qr, {
+            errorCorrectionLevel: 'H',
+            margin: 2,
+            width: 400
+        });
+        
+        // Store session in global sessions
+        globalSessions.qr.set(sessionIdToUse, {
+            qr: qr,
+            qrImage: qrImage,
+            timestamp: Date.now(),
+            sock: sock,
+            status: 'qr_generated',
+            type: 'qr',
+            number: number || 'N/A',
+            createdAt: new Date().toISOString()
+        });
+
+        // Store in local sessions if available
+        if (globalSessions.sessionSuccess) {
+            globalSessions.sessionSuccess.set(sessionIdToUse, {
+                id: sessionIdToUse,
+                type: 'qr',
+                number: number || 'N/A',
+                createdAt: new Date().toISOString(),
+                status: 'active'
+            });
+        }
+
+        res.json({
+            success: true,
+            sessionId: sessionIdToUse,
+            qrImage: qrImage,
+            qrString: qr,
+            status: 'qr_generated',
+            message: '✅ QR Code generated successfully!',
+            instructions: 'Open WhatsApp > Linked Devices > Link with QR code and scan this code',
+            viewPage: `/session-success/${sessionIdToUse}?number=${number || 'N/A'}&type=qr`,
+            channels: {
+                telegram: 'https://t.me/marinyametech',
+                youtube: 'https://youtube.com/@marinyametech',
+                website: 'https://Marinyame.zone.id'
+            },
+            warning: 'Do NOT share your QR code or session ID with anyone.'
+        });
+
+    } catch (error) {
+        console.error('QR generation error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message || 'Failed to generate QR code',
+            error: error.message
+        });
+    }
 });
 
-// Global uncaught exception handler
-process.on('uncaughtException', (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (e.includes("Stream Errored")) return;
-    if (e.includes("Stream Errored (restart required)")) return;
-    if (e.includes("statusCode: 515")) return;
-    if (e.includes("statusCode: 503")) return;
-    console.log('Caught exception: ', err);
+// ===== GENERATE QR CODE WITH REDIRECT =====
+router.get('/generate-redirect', async (req, res) => {
+    try {
+        const { number } = req.query;
+        
+        // Generate session ID
+        const sessionId = `qr_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+        
+        // Create WhatsApp socket
+        const sock = await makeWaSocket();
+        
+        // Set up QR handler
+        let qrCode = null;
+        let qrPromise = new Promise((resolve) => {
+            const handleQR = (qr) => {
+                qrCode = qr;
+                resolve(qr);
+            };
+            sock.ev.on('qr', handleQR);
+            
+            setTimeout(() => {
+                sock.ev.off('qr', handleQR);
+                if (!qrCode) {
+                    resolve(null);
+                }
+            }, 30000);
+        });
+
+        const qr = await qrPromise;
+        
+        if (!qr) {
+            return res.status(404).json({
+                success: false,
+                message: 'QR code not available. Please try again.'
+            });
+        }
+
+        // Generate QR image
+        const qrImage = await QRCode.toDataURL(qr);
+        
+        // Store session
+        globalSessions.qr.set(sessionId, {
+            qr: qr,
+            qrImage: qrImage,
+            timestamp: Date.now(),
+            sock: sock,
+            status: 'qr_generated',
+            type: 'qr',
+            number: number || 'N/A'
+        });
+
+        // Redirect to session success page
+        res.redirect(`/session-success/${sessionId}?number=${number || 'N/A'}&type=qr`);
+
+    } catch (error) {
+        console.error('QR redirect error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== GET QR CODE IMAGE DIRECTLY =====
+router.get('/image/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const session = globalSessions.qr.get(sessionId);
+        
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        if (!session.qrImage) {
+            // Regenerate QR if needed
+            const qrImage = await QRCode.toDataURL(session.qr, {
+                errorCorrectionLevel: 'H',
+                margin: 2,
+                width: 400
+            });
+            session.qrImage = qrImage;
+            globalSessions.qr.set(sessionId, session);
+        }
+
+        // Send as image
+        res.setHeader('Content-Type', 'image/png');
+        const imgBuffer = Buffer.from(session.qrImage.split(',')[1], 'base64');
+        res.send(imgBuffer);
+
+    } catch (error) {
+        console.error('QR image error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== GET ALL QR SESSIONS =====
+router.get('/sessions', (req, res) => {
+    try {
+        const sessions = Array.from(globalSessions.qr.entries()).map(([id, data]) => ({
+            sessionId: id,
+            type: 'qr',
+            number: data.number || 'N/A',
+            status: data.status || 'active',
+            timestamp: data.timestamp,
+            createdAt: data.createdAt || new Date(data.timestamp).toISOString(),
+            age: Math.floor((Date.now() - (data.timestamp || Date.now())) / 1000),
+            hasQR: !!data.qr
+        }));
+        
+        res.json({
+            success: true,
+            count: sessions.length,
+            sessions: sessions
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== GET SPECIFIC QR SESSION =====
+router.get('/session/:id', (req, res) => {
+    try {
+        const { id } = req.params;
+        const session = globalSessions.qr.get(id);
+        
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            session: {
+                sessionId: id,
+                type: 'qr',
+                number: session.number || 'N/A',
+                status: session.status,
+                timestamp: session.timestamp,
+                createdAt: session.createdAt || new Date(session.timestamp).toISOString(),
+                hasQR: !!session.qr
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== DELETE QR SESSION =====
+router.delete('/session/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const session = globalSessions.qr.get(id);
+        
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        // Close socket if exists
+        if (session.sock) {
+            try {
+                await session.sock.logout();
+                await session.sock.end();
+                await session.sock.destroy();
+            } catch (error) {
+                console.error('Error closing QR session socket:', error);
+            }
+        }
+
+        // Delete session folder if exists
+        const sessionPath = path.join(__dirname, 'sessions', id);
+        if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+        }
+
+        globalSessions.qr.delete(id);
+        
+        res.json({
+            success: true,
+            message: '✅ QR Session deleted successfully',
+            sessionId: id,
+            deletedAt: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('Error deleting QR session:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== CHECK QR STATUS =====
+router.get('/status/:sessionId', (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const session = globalSessions.qr.get(sessionId);
+        
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            sessionId: sessionId,
+            status: session.status || 'unknown',
+            hasQR: !!session.qr,
+            timestamp: session.timestamp,
+            age: Math.floor((Date.now() - session.timestamp) / 1000)
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ===== REGENERATE QR CODE =====
+router.post('/regenerate/:sessionId', async (req, res) => {
+    try {
+        const { sessionId } = req.params;
+        const session = globalSessions.qr.get(sessionId);
+        
+        if (!session) {
+            return res.status(404).json({
+                success: false,
+                message: 'Session not found'
+            });
+        }
+
+        // Generate new QR code
+        const newQR = await QRCode.toDataURL(session.qr, {
+            errorCorrectionLevel: 'H',
+            margin: 2,
+            width: 400
+        });
+
+        session.qrImage = newQR;
+        session.timestamp = Date.now();
+        session.status = 'regenerated';
+        globalSessions.qr.set(sessionId, session);
+
+        res.json({
+            success: true,
+            message: 'QR Code regenerated successfully',
+            sessionId: sessionId,
+            qrImage: newQR
+        });
+
+    } catch (error) {
+        console.error('Regenerate QR error:', error);
+        res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
 });
 
 export default router;
